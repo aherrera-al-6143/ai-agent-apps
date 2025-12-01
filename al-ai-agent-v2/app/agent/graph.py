@@ -1,18 +1,33 @@
 """
-LangGraph workflow definition for the agent
+LangGraph workflow definition for the agent.
+
+Supports two modes:
+1. Legacy mode: Single ReAct agent with all tools (original behavior)
+2. Routed mode: Semantic router + specialized sub-agents (recommended)
 """
 from __future__ import annotations
 
-from typing import Annotated, Sequence
-from typing_extensions import TypedDict
+import os
+from typing import Annotated, Sequence, Literal
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_openai import ChatOpenAI
+from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.postgres import PostgresSaver
+from typing_extensions import TypedDict
 
 from app.agent.tools import create_query_database_tool, create_generate_kpi_report_tool
+from app.agent.prompts import KPI_AGENT_PROMPT, QUERY_AGENT_PROMPT
+from app.agent.semantic_router import SemanticRouter
 from app.database.connection import DATABASE_URL
+from app.services.llm_service import LLMService
+
+
+# =============================================================================
+# CHECKPOINTER MANAGEMENT
+# =============================================================================
 
 _checkpointer: PostgresSaver | None = None
 _checkpointer_cm = None  # Keep context manager alive
@@ -22,11 +37,8 @@ def initialize_checkpointer():
     """Initialize the checkpointer at application startup."""
     global _checkpointer, _checkpointer_cm
     if _checkpointer is None:
-        # PostgresSaver.from_conn_string returns a context manager
-        # We need to keep the context manager alive to prevent connection closure
         _checkpointer_cm = PostgresSaver.from_conn_string(DATABASE_URL)
         _checkpointer = _checkpointer_cm.__enter__()
-        # Setup tables if they don't exist
         _checkpointer.setup()
 
 
@@ -38,15 +50,62 @@ def _get_checkpointer() -> PostgresSaver:
     return _checkpointer
 
 
-# Agent state for create_react_agent
+# =============================================================================
+# STATE DEFINITIONS
+# =============================================================================
+
 class AgentState(TypedDict):
-    """State for the ReAct agent"""
+    """State for the ReAct agent (legacy mode)"""
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
-def create_agent_graph(agent_config: dict = None, use_cache: bool = True):
+class RoutedAgentState(TypedDict):
+    """State for the routed agent with semantic classification"""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    route: str  # "kpi" or "query"
+    route_confidence: float
+    route_method: str  # "keyword" or "llm"
+    route_reasoning: str
+
+
+# =============================================================================
+# LLM CONFIGURATION
+# =============================================================================
+
+def _get_llm(agent_config: dict = None):
+    """Get configured LLM instance."""
+    if agent_config is None:
+        agent_config = {}
+    
+    model_name = agent_config.get("model", os.getenv("DEFAULT_MODEL_VERSION", "google/gemini-2.5-flash"))
+    
+    # Determine API configuration
+    if "google/" in model_name or "anthropic/" in model_name or os.getenv("OPEN_ROUTER_KEY"):
+        api_key = os.getenv("OPEN_ROUTER_KEY") or os.getenv("OPENAI_API_KEY")
+        base_url = "https://openrouter.ai/api/v1"
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_API_BASE")
+    
+    return ChatOpenAI(
+        model=model_name,
+        temperature=0,
+        max_tokens=2000,
+        api_key=api_key,
+        base_url=base_url
+    )
+
+
+# =============================================================================
+# LEGACY MODE (Original single-agent approach)
+# =============================================================================
+
+def create_legacy_agent_graph(agent_config: dict = None, use_cache: bool = True):
     """
-    Create and compile the agent workflow using create_react_agent
+    Create the LEGACY agent (single ReAct agent with all tools).
+    
+    This is the original architecture - kept for backward compatibility.
+    Use create_routed_agent_graph for better tool selection.
     
     Args:
         agent_config: Configuration dict with model, dataset_filter, etc.
@@ -58,111 +117,44 @@ def create_agent_graph(agent_config: dict = None, use_cache: bool = True):
     if agent_config is None:
         agent_config = {}
     
-    # Create the configured query tool
+    # Create tools
     query_tool = create_query_database_tool(agent_config, use_cache)
-    
-    # Create the KPI report generation tool
-    # URL can be configured via environment variable
     kpi_api_url = os.getenv("KPI_REPORTS_API_URL", "http://localhost:8001")
     kpi_report_tool = create_generate_kpi_report_tool(kpi_api_url)
     
-    # System message with instructions
+    # Legacy system prompt (combined instructions for both tools)
     system_message = """You are a helpful data analyst assistant that answers questions about property data.
 
 When a user asks a question:
-1. FIRST check if previous ToolMessage objects in the conversation history contain the data you need
-2. Check the 'columns_queried' field in previous tool results to see what columns were fetched
-3. If you already have the data AND all needed columns, use it to answer directly WITHOUT calling the tool again
-4. If you need columns that are NOT in 'columns_queried' from previous results, you MUST call the tool again
-5. ONLY call the query_database_tool when you need NEW data or DIFFERENT columns than what's in previous results
+1. FIRST check if previous ToolMessage objects contain the data you need
+2. Check 'columns_queried' field to see what columns were fetched
+3. Use 'rows_returned' for counts (NOT len(data))
 
-Previous query results are stored in ToolMessage objects in the conversation history. These contain:
-- 'sql_query': The SQL query that was executed
-- 'data': The complete dataset rows returned
-- 'rows_returned': The TOTAL count of rows (use this for counts, NOT len(data))
-- 'columns_queried': LIST of column names that were fetched (IMPORTANT: check this!)
-- 'query_type': Either "raw_data" (has all columns) or "aggregation" (has specific columns only)
-- Other metadata about the query
+TOOL SELECTION (CRITICAL):
+═══════════════════════════════════════════════════════════════════
 
-CRITICAL - Using Query Result Metadata:
-- ALWAYS use 'rows_returned' field for the total count (do NOT count items in data array)
-- The 'data' field may be a sample (limited for performance)
-- For accurate counts and totals, use the metadata values provided
+🎯 USE generate_kpi_report_tool WHEN user asks for:
+- "strategic overview" of any office/region
+- "portfolio analysis" or "portfolio health"
+- "performance report" or "KPI report"
+- "critical analysis" or "underperforming properties"
+- "top performers" analysis
+- Any request implying a PDF/report output
 
-CRITICAL COLUMN CHECKING RULES:
-- If query_type is "raw_data" → all columns available, safe to answer follow-ups
-- If query_type is "aggregation" → only specific columns available, check 'columns_queried' list
-- If user asks about a column NOT in 'columns_queried', you MUST call the tool again with the new query
-- Examples:
-  * Previous: columns_queried=["property_name", "loss_date"], user asks "summarize by office" → MUST call tool (need "office" column)
-  * Previous: query_type="raw_data", user asks "summarize by office" → Can use existing data (has all columns)
+📊 USE query_database_tool WHEN user asks for:
+- Specific counts ("how many properties...")
+- Raw data retrieval ("list all properties in...")
+- Specific metrics ("what is the occupancy of...")
+- Filtering questions ("properties lost in September...")
+- Property-specific lookups ("tell me about Continental Tower")
 
-Use the query_database_tool to get fresh data from the database when:
-- User asks for information requiring columns not in 'columns_queried'
-- User wants different filters or date ranges
-- This is a new query about different data
-- Previous query_type was "aggregation" and user needs different columns
+═══════════════════════════════════════════════════════════════════
 
-Do NOT call the tool when:
-- User asks "are you sure?" or similar clarification questions
-- You have query_type="raw_data" and can answer from existing data
-- You have the exact columns needed in 'columns_queried' from previous aggregation results
-- User is asking follow-up questions answerable with existing data
-
-After getting results, provide clear, accurate answers with specific numbers from the data.
-
-CRITICAL - Reporting Counts:
-When reporting how many items were found, you MUST use the 'rows_returned' value from the tool result.
-DO NOT manually count items in the 'data' array - always use 'rows_returned' for accuracy.
-
-RESPONSE FORMAT:
-- If results have ≤10 items: List all items
-- If results have >10 items: Provide the EXACT count, a brief summary, and 3-5 sample items
-- IMPORTANT: Use the actual row count from the data. Do NOT use words like "top" or "best" - just say "Here are 5 examples:" or "Sample properties:"
-
-KPI REPORT GENERATION:
-When users ask for KPI reports, portfolio analysis, or performance overviews, use the generate_kpi_report tool.
-Available report types:
-- strategic_overview: High-level portfolio health and performance distribution
-- critical_analysis: Focus on worst-performing properties needing attention
-- top_performers: Analysis of best-performing properties and success patterns
-- operational_focus: Operational issues requiring immediate action
-
-When generating reports:
-1. Confirm the office/region with the user if not specified
-2. Ask about filters (stabilized properties, exclude lease-up) if relevant
-3. Generate the report and share the PDF path
-4. The response includes SQL queries used - use these for follow-up questions
-5. The stats object can be used to answer detailed questions about the report
+After getting results, provide clear, accurate answers with specific numbers.
 """
     
-    # Import LLM model
-    from langchain_openai import ChatOpenAI
-    import os
+    llm = _get_llm(agent_config)
     
-    # Get model from config or use default
-    model_name = agent_config.get("model", os.getenv("DEFAULT_MODEL_VERSION", "google/gemini-2.5-flash"))
-    
-    # Determine API configuration
-    # If using OpenRouter (google/, anthropic/, etc. models), use OPEN_ROUTER_KEY
-    # Otherwise use standard OPENAI_API_KEY
-    if "google/" in model_name or "anthropic/" in model_name or os.getenv("OPEN_ROUTER_KEY"):
-        api_key = os.getenv("OPEN_ROUTER_KEY") or os.getenv("OPENAI_API_KEY")
-        base_url = "https://openrouter.ai/api/v1"
-    else:
-        api_key = os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("OPENAI_API_BASE")
-    
-    # Configure the LLM
-    llm = ChatOpenAI(
-        model=model_name,
-        temperature=0,
-        max_tokens=2000,
-        api_key=api_key,
-        base_url=base_url
-    )
-    
-    # Create the ReAct agent with the tools
     agent = create_react_agent(
         llm,
         tools=[query_tool, kpi_report_tool],
@@ -173,3 +165,191 @@ When generating reports:
     return agent
 
 
+# =============================================================================
+# ROUTED MODE (New semantic routing approach - RECOMMENDED)
+# =============================================================================
+
+def create_routed_agent_graph(agent_config: dict = None, use_cache: bool = True):
+    """
+    Create the ROUTED agent with semantic classification.
+    
+    Architecture:
+    1. Semantic Router classifies query intent (keyword matching → LLM fallback)
+    2. Routes to specialized sub-agent (KPI or Query)
+    3. Each sub-agent has focused prompts and single tool
+    
+    Args:
+        agent_config: Configuration dict with model, dataset_filter, etc.
+        use_cache: Whether to use caching
+    
+    Returns:
+        Compiled LangGraph StateGraph with routing
+    """
+    if agent_config is None:
+        agent_config = {}
+    
+    # Initialize services
+    llm = _get_llm(agent_config)
+    llm_service = LLMService()
+    router = SemanticRouter(llm_service)
+    
+    # Create specialized tools
+    query_tool = create_query_database_tool(agent_config, use_cache)
+    kpi_api_url = os.getenv("KPI_REPORTS_API_URL", "http://localhost:8001")
+    kpi_report_tool = create_generate_kpi_report_tool(kpi_api_url)
+    
+    # Create specialized sub-agents
+    kpi_agent = create_react_agent(
+        llm,
+        tools=[kpi_report_tool],
+        prompt=KPI_AGENT_PROMPT
+    )
+    
+    query_agent = create_react_agent(
+        llm,
+        tools=[query_tool],
+        prompt=QUERY_AGENT_PROMPT
+    )
+    
+    # =================================================================
+    # GRAPH NODES
+    # =================================================================
+    
+    def route_query(state: RoutedAgentState) -> dict:
+        """
+        Classify the incoming query and determine routing.
+        Uses SemanticRouter for tiered classification.
+        """
+        messages = state.get("messages", [])
+        
+        # Find the last human message
+        last_human_message = None
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                last_human_message = msg
+                break
+        
+        if not last_human_message:
+            # Default to query for safety
+            return {
+                "route": "query",
+                "route_confidence": 0.5,
+                "route_method": "default",
+                "route_reasoning": "No human message found"
+            }
+        
+        # Classify the query
+        result = router.route(last_human_message.content)
+        
+        # Log the routing decision
+        explanation = router.explain_route(result)
+        print(f"[ROUTER] {explanation}")
+        
+        return {
+            "route": result["route"],
+            "route_confidence": result["confidence"],
+            "route_method": result["method"],
+            "route_reasoning": result.get("reasoning", result.get("matched_keyword", ""))
+        }
+    
+    def validate_route(state: RoutedAgentState) -> dict:
+        """
+        Guardrail node to validate and log routing decisions.
+        Can be extended with additional validation logic.
+        """
+        route = state.get("route", "query")
+        confidence = state.get("route_confidence", 0)
+        method = state.get("route_method", "unknown")
+        reasoning = state.get("route_reasoning", "")
+        
+        # Log for monitoring/debugging
+        print(f"[VALIDATE] Route: {route} | Confidence: {confidence:.2f} | Method: {method}")
+        if reasoning:
+            print(f"[VALIDATE] Reasoning: {reasoning}")
+        
+        # Future: Add more guardrails here
+        # - Low confidence handling
+        # - Route override rules
+        # - Audit logging
+        
+        return {}  # No state changes needed
+    
+    def call_kpi_agent(state: RoutedAgentState) -> dict:
+        """Execute the KPI agent."""
+        # Extract just the messages for the sub-agent
+        result = kpi_agent.invoke({"messages": state["messages"]})
+        return {"messages": result["messages"]}
+    
+    def call_query_agent(state: RoutedAgentState) -> dict:
+        """Execute the Query agent."""
+        result = query_agent.invoke({"messages": state["messages"]})
+        return {"messages": result["messages"]}
+    
+    def get_route(state: RoutedAgentState) -> Literal["kpi", "query"]:
+        """Get the route from state for conditional edge."""
+        return state.get("route", "query")
+    
+    # =================================================================
+    # BUILD GRAPH
+    # =================================================================
+    
+    workflow = StateGraph(RoutedAgentState)
+    
+    # Add nodes
+    workflow.add_node("route", route_query)
+    workflow.add_node("validate", validate_route)
+    workflow.add_node("kpi_agent", call_kpi_agent)
+    workflow.add_node("query_agent", call_query_agent)
+    
+    # Define edges
+    workflow.set_entry_point("route")
+    workflow.add_edge("route", "validate")
+    
+    # Conditional routing after validation
+    workflow.add_conditional_edges(
+        "validate",
+        get_route,
+        {
+            "kpi": "kpi_agent",
+            "query": "query_agent"
+        }
+    )
+    
+    # Terminal edges
+    workflow.add_edge("kpi_agent", END)
+    workflow.add_edge("query_agent", END)
+    
+    # Compile with checkpointer
+    return workflow.compile(checkpointer=_get_checkpointer())
+
+
+# =============================================================================
+# FACTORY FUNCTION (Main Entry Point)
+# =============================================================================
+
+def create_agent_graph(agent_config: dict = None, use_cache: bool = True, use_routing: bool = True):
+    """
+    Create the agent graph.
+    
+    This is the main entry point. By default, uses the new routed architecture.
+    Set use_routing=False for legacy single-agent behavior.
+    
+    Args:
+        agent_config: Configuration dict with model, dataset_filter, etc.
+        use_cache: Whether to use caching
+        use_routing: If True (default), use semantic routing. If False, use legacy mode.
+    
+    Returns:
+        Compiled LangGraph agent
+    """
+    # Check environment variable override
+    env_routing = os.getenv("USE_SEMANTIC_ROUTING", "true").lower()
+    if env_routing == "false":
+        use_routing = False
+    
+    if use_routing:
+        print("[AGENT] Using ROUTED agent architecture (semantic routing enabled)")
+        return create_routed_agent_graph(agent_config, use_cache)
+    else:
+        print("[AGENT] Using LEGACY agent architecture (single ReAct agent)")
+        return create_legacy_agent_graph(agent_config, use_cache)

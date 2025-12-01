@@ -19,5 +19,42 @@
     ],
     "query_6": [
         "What portfolios are expected to churn next month"
-    ]
+    ],
+    "_comment_kpi_tests": "These tests should route to the KPI agent and use generate_kpi_report_tool",
+    "kpi_1": [
+        "Give me a strategic overview of Dallas"
+    ],
+    "kpi_2": [
+        "Generate a portfolio analysis for Houston"
+    ],
+    "kpi_3": [
+        "What's the portfolio health for Atlanta?"
+    ],
+    "kpi_4": [
+        "Show me the critical analysis for Denver - focus on underperforming properties"
+    ],
+    "kpi_5": [
+        "I need a performance report for San Antonio"
+    ],
+    "_comment_routing_tests": "These tests verify correct routing between tools",
+    "routing_test_1": {
+        "query": "How many properties are in Dallas?",
+        "expected_route": "query",
+        "expected_tool": "query_database_tool"
+    },
+    "routing_test_2": {
+        "query": "Give me a strategic overview of Dallas",
+        "expected_route": "kpi", 
+        "expected_tool": "generate_kpi_report_tool"
+    },
+    "routing_test_3": {
+        "query": "What is the occupancy for Continental Tower?",
+        "expected_route": "query",
+        "expected_tool": "query_database_tool"
+    },
+    "routing_test_4": {
+        "query": "Generate a KPI report for Houston",
+        "expected_route": "kpi",
+        "expected_tool": "generate_kpi_report_tool"
+    }
 }
