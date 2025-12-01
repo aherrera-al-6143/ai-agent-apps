@@ -1,0 +1,43 @@
+{
+    "query_1": [
+        {
+            "question": "How many portfolios churned last month?",
+            "count": [84],
+            "notes": ""
+        },
+        {
+            "question": "What are the names of those portfolios?",
+            "count": [84],
+            "answer": ["Across the Street", "Alley South Lake Union",
+            "Allina La Jolla", "Ansley Murray Hill",
+            "Arbors, The", "Arioso", "Avery At Moorpark"],
+            "notes": "answer list is truncated"
+        },
+        {
+            "question": "Which corporate office had the most churn?",
+            "answer": "West",
+            "notes": ""
+        }
+    ],
+    "query_2": [
+        {
+            "question": "What's the count of the portfolios that churned in August 2025?",
+            "count": [58],
+            "notes": ""
+        }
+    ],
+    "query_3": [
+        {
+            "question": "Total count of properties that were lost in September 2025?",
+            "count": [60],
+            "notes": ""
+        }
+    ],
+    "query_4": [
+        {
+            "question": "What is the year-over-year change in October churn?",
+            "count": [0.47],
+            "notes": "47.4% increase in churn or 27 more portfolios lost"
+        }
+    ]
+  }

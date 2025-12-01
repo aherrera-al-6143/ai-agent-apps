@@ -1,0 +1,23 @@
+{
+    "query_1": [
+        "What are properties that were lost in September 2025",
+        "are you sure this is the correct count?",
+        "summarize the losses by corporate office",
+        "summarize the losses by corporate office for sept 2025"
+    ],
+    "query_2": [
+        "Tell me about the Denver portfolio"
+    ],
+    "query_3": [
+        "What is the average occupancy in Denver"
+    ],
+    "query_4": [
+        "Tell me about the kpis for continental tower" 
+    ],
+    "query_5": [
+        "Get me the average 90 day trailing occupancy for denver corporate operating office"
+    ],
+    "query_6": [
+        "What portfolios are expected to churn next month"
+    ]
+}
